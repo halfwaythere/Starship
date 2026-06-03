@@ -1,4 +1,4 @@
-#include "global.h"
+﻿#include "global.h"
 #include "assets/ast_corneria.h"
 #include "assets/ast_sector_x.h"
 #include "assets/ast_sector_y.h"
@@ -78,11 +78,11 @@ u32 gWarpRingSfx[] = {
 };
 
 void Object_PlayerSfx(f32* pos, u32 sfxId, s32 playerNum) {
-    PRINTF("CHIME SET \n");
-    PRINTF("BOMB SET 1\n");
-    PRINTF("BOMB SET 2\n");
-    PRINTF("center_X        %f\n");
-    PRINTF("Enm->obj.pos.x  %f\n");
+    printf("CHIME SET \n");
+    printf("BOMB SET 1\n");
+    printf("BOMB SET 2\n");
+    printf("center_X        %f\n");
+    printf("Enm->obj.pos.x  %f\n");
     if (!gVersusMode) {
         AUDIO_PLAY_SFX(sfxId, gDefaultSfxSource, 4);
     } else {
@@ -145,12 +145,973 @@ bool func_enmy_80061148(Vec3f* arg0, f32 arg1) {
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Randomizer helpers (cleaned, commented, verbose logging, relaxed matching)
+// -----------------------------------------------------------------------------
+// Notes:
+// - We maintain a per-level actor pool built from level ObjectInit entries and
+//   the static event actor table `sEventActorInfo[]`. If the pool is too small
+//   we optionally fill from the global actor table.
+// - Replacement candidates exclude a hardcoded list (partners / special actors).
+// - We prefer similar draw/action/cullDistance matches but fall back to looser
+//   rules when no strict candidate exists.
+// - Extensive printf logging added to diagnose decisions at runtime.
+// -----------------------------------------------------------------------------
+
+// Randomizer filter toggles — set to 0 to disable (allow) the filter, 1 to enable (enforce) it
+#ifndef RANDOMIZER_ENABLED
+#define RANDOMIZER_ENABLED 1
+#endif
+
+#ifndef RANDOMIZER_FILTER_CULL_DISTANCE
+#define RANDOMIZER_FILTER_CULL_DISTANCE 0 // 0 = ignore cull, 1 = enforce cull checks
+#endif
+
+#ifndef RANDOMIZER_FILTER_DRAWTYPE
+#define RANDOMIZER_FILTER_DRAWTYPE 0 // 0 = ignore drawType mismatch, 1 = enforce
+#endif
+
+#ifndef RANDOMIZER_FILTER_ACTION
+#define RANDOMIZER_FILTER_ACTION 0 // 0 = ignore action mismatch, 1 = enforce
+#endif
+
+#ifndef RANDOMIZER_FILTER_EXCLUDE_PARTNERS
+#define RANDOMIZER_FILTER_EXCLUDE_PARTNERS 1 // 0 = allow partners, 1 = exclude
+#endif
+
+#ifndef RANDOMIZER_FILTER_EXCLUDE_EVENTS
+#define RANDOMIZER_FILTER_EXCLUDE_EVENTS 0 // 0 = allow events, 1 = exclude events from non-event spawns
+#endif
+
+// Object type categorization for logging
+typedef enum {
+    OBJ_CATEGORY_FLIGHT,  // Flying enemies in formation (Garuda, enemy ships, etc.)
+    OBJ_CATEGORY_GROUND,  // Ground-based enemies (robots, skibots, etc.)
+    OBJ_CATEGORY_BOSS,    // Boss encounters
+    OBJ_CATEGORY_TERRAIN, // Obstacles and scenery
+    OBJ_CATEGORY_SPECIAL, // Crewmates, event actors, etc.
+    OBJ_CATEGORY_UNKNOWN
+} ObjectCategory;
+
+// ObjectId -> string mapping (lookup table) for readable logs.
+// The enum values in sf64object.h map 0..OBJ_ID_MAX-1 to names below.
+static const char* sObjectIdNames[OBJ_ID_MAX] = {
+    "OBJ_SCENERY_CO_STONE_ARCH",         /* 0 */
+    "OBJ_SCENERY_CO_BUMP_1",             /* 1 */
+    "OBJ_SCENERY_CO_BUMP_2",             /* 2 */
+    "OBJ_SCENERY_CO_BUMP_3",             /* 3 */
+    "OBJ_SCENERY_CO_BUMP_4",             /* 4 */
+    "OBJ_SCENERY_CO_BUMP_5",             /* 5 */
+    "OBJ_SCENERY_CO_HIGHWAY_1",          /* 6 */
+    "OBJ_SCENERY_CO_HIGHWAY_2",          /* 7 */
+    "OBJ_SCENERY_CO_HIGHWAY_3",          /* 8 */
+    "OBJ_SCENERY_CO_HIGHWAY_4",          /* 9 */
+    "OBJ_SCENERY_CO_BUILDING_1",         /*10*/
+    "OBJ_SCENERY_CO_BUILDING_2",         /*11*/
+    "OBJ_SCENERY_CO_BUILDING_3",         /*12*/
+    "OBJ_SCENERY_CO_BUILDING_4",         /*13*/
+    "OBJ_SCENERY_CO_BUILDING_5",         /*14*/
+    "OBJ_SCENERY_CO_BUILDING_6",         /*15*/
+    "OBJ_SCENERY_CO_BUILDING_7",         /*16*/
+    "OBJ_SCENERY_CO_BUILDING_8",         /*17*/
+    "OBJ_SCENERY_CO_BUILDING_ON_FIRE",   /*18*/
+    "OBJ_SCENERY_CO_TOWER",              /*19*/
+    "OBJ_SCENERY_CO_ARCH_1",             /*20*/
+    "OBJ_SCENERY_CO_ARCH_2",             /*21*/
+    "OBJ_SCENERY_CO_ARCH_3",             /*22*/
+    "OBJ_SCENERY_CO_RADAR_DISH",         /*23*/
+    "OBJ_SCENERY_CO_HIGHWAY_5",          /*24*/
+    "OBJ_SCENERY_CO_HIGHWAY_6",          /*25*/
+    "OBJ_SCENERY_CO_HIGHWAY_7",          /*26*/
+    "OBJ_SCENERY_CO_HIGHWAY_8",          /*27*/
+    "OBJ_SCENERY_CO_HIGHWAY_9",          /*28*/
+    "OBJ_SCENERY_TI_SKULL",              /*29*/
+    "OBJ_SCENERY_TI_RIB_0",              /*30*/
+    "OBJ_SCENERY_TI_RIB_1",              /*31*/
+    "OBJ_SCENERY_TI_RIB_2",              /*32*/
+    "OBJ_SCENERY_TI_RIB_3",              /*33*/
+    "OBJ_SCENERY_TI_RIB_4",              /*34*/
+    "OBJ_SCENERY_TI_RIB_5",              /*35*/
+    "OBJ_SCENERY_TI_RIB_6",              /*36*/
+    "OBJ_SCENERY_TI_RIB_7",              /*37*/
+    "OBJ_SCENERY_TI_RIB_8",              /*38*/
+    "OBJ_SCENERY_ME_TUNNEL",             /*39*/
+    "OBJ_SCENERY_CO_BUILDING_9",         /*40*/
+    "OBJ_SCENERY_CO_BUILDING_10",        /*41*/
+    "OBJ_SCENERY_IBEAM",                 /*42*/
+    "OBJ_SCENERY_ZO_ROCK",               /*43*/
+    "OBJ_SCENERY_ZO_OIL_RIG_1",          /*44*/
+    "OBJ_SCENERY_ZO_OIL_RIG_2",          /*45*/
+    "OBJ_SCENERY_ZO_OIL_RIG_3",          /*46*/
+    "OBJ_SCENERY_ZO_ISLAND",             /*47*/
+    "OBJ_SCENERY_VE1_WALL_1",            /*48*/
+    "OBJ_SCENERY_VE1_WALL_2",            /*49*/
+    "OBJ_SCENERY_VE1_WALL_3",            /*50*/
+    "OBJ_SCENERY_VE1_HALLWAY_OBSTACLE",  /*51*/
+    "OBJ_SCENERY_VE1_GENERATOR",         /*52*/
+    "OBJ_SCENERY_VE1_WATCH_POST",        /*53*/
+    "OBJ_SCENERY_CO_WATERFALL",          /*54*/
+    "OBJ_SCENERY_CO_ROCKWALL",           /*55*/
+    "OBJ_SCENERY_CO_DOORS",              /*56*/
+    "OBJ_SCENERY_TI_PILLAR",             /*57*/
+    "OBJ_SCENERY_TI_BRIDGE",             /*58*/
+    "OBJ_SCENERY_MA_BUILDING_1",         /*59*/
+    "OBJ_SCENERY_MA_BUILDING_2",         /*60*/
+    "OBJ_SCENERY_MA_TOWER",              /*61*/
+    "OBJ_SCENERY_MA_WALL_1",             /*62*/
+    "OBJ_SCENERY_GUILLOTINE_HOUSING",    /*63*/
+    "OBJ_SCENERY_MA_GUILLOTINE",         /*64*/
+    "OBJ_SCENERY_MA_PROXIMITY_LIGHT",    /*65*/
+    "OBJ_SCENERY_MA_WALL_2",             /*66*/
+    "OBJ_SCENERY_MA_WALL_3",             /*67*/
+    "OBJ_SCENERY_MA_WALL_4",             /*68*/
+    "OBJ_SCENERY_MA_TERRAIN_BUMP",       /*69*/
+    "OBJ_SCENERY_MA_FLOOR_1",            /*70*/
+    "OBJ_SCENERY_MA_FLOOR_2",            /*71*/
+    "OBJ_SCENERY_MA_FLOOR_3",            /*72*/
+    "OBJ_SCENERY_MA_FLOOR_4",            /*73*/
+    "OBJ_SCENERY_MA_FLOOR_5",            /*74*/
+    "OBJ_SCENERY_MA_FLOOR_6",            /*75*/
+    "OBJ_SCENERY_MA_WEAPONS_FACTORY",    /*76*/
+    "OBJ_SCENERY_MA_INDICATOR_SIGN",     /*77*/
+    "OBJ_SCENERY_MA_DISTANCE_SIGN_1",    /*78*/
+    "OBJ_SCENERY_MA_DISTANCE_SIGN_2",    /*79*/
+    "OBJ_SCENERY_MA_DISTANCE_SIGN_3",    /*80*/
+    "OBJ_SCENERY_MA_DISTANCE_SIGN_4",    /*81*/
+    "OBJ_SCENERY_MA_DISTANCE_SIGN_5",    /*82*/
+    "OBJ_SCENERY_MA_TRAIN_STOP_BLOCK",   /*83*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_1",  /*84*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_2",  /*85*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_3",  /*86*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_4",  /*87*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_5",  /*88*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_6",  /*89*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_7",  /*90*/
+    "OBJ_SCENERY_MA_RAILROAD_SWITCH_8",  /*91*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_1",      /*92*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_2",      /*93*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_3",      /*94*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_4",      /*95*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_5",      /*96*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_6",      /*97*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_7",      /*98*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_8",      /*99*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_9",      /*100*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_10",     /*101*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_11",     /*102*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_12",     /*103*/
+    "OBJ_SCENERY_MA_SWITCH_TRACK",       /*104*/
+    "OBJ_SCENERY_MA_TRAIN_TRACK_13",     /*105*/
+    "OBJ_SCENERY_SY_SHIP_1",             /*106*/
+    "OBJ_SCENERY_SY_SHIP_2",             /*107*/
+    "OBJ_SCENERY_SY_SHIP_3",             /*108*/
+    "OBJ_SCENERY_SY_SHIP_3_DESTROYED",   /*109*/
+    "OBJ_SCENERY_SY_SHIP_4",             /*110*/
+    "OBJ_SCENERY_SY_SHIP_DEBRIS",        /*111*/
+    "OBJ_SCENERY_SY_SHIP_2_DESTROYED",   /*112*/
+    "OBJ_SPRITE_SY_SHIP_2",              /*113*/
+    "OBJ_SPRITE_SY_SHIP_3",              /*114*/
+    "OBJ_SCENERY_SY_SHIP_MISSILE",       /*115*/
+    "OBJ_SCENERY_SY_SHIP_WINDOWS",       /*116*/
+    "OBJ_SCENERY_AQ_CORAL_REEF_1",       /*117*/
+    "OBJ_SCENERY_AQ_TUNNEL_1",           /*118*/
+    "OBJ_SCENERY_AQ_ARCH",               /*119*/
+    "OBJ_SCENERY_AQ_CORAL_REEF_2",       /*120*/
+    "OBJ_SCENERY_AQ_ROCK",               /*121*/
+    "OBJ_SCENERY_AQ_WALL_1",             /*122*/
+    "OBJ_SCENERY_AQ_ROOF",               /*123*/
+    "OBJ_SCENERY_AQ_BUMP_1",             /*124*/
+    "OBJ_SCENERY_AQ_TUNNEL_2",           /*125*/
+    "OBJ_SCENERY_AQ_BUMP_2",             /*126*/
+    "OBJ_SCENERY_VE1_TEMPLE_ENTRANCE",   /*127*/
+    "OBJ_SCENERY_VE1_TEMPLE_INTERIOR_1", /*128*/
+    "OBJ_SCENERY_VE1_TEMPLE_INTERIOR_2", /*129*/
+    "OBJ_SCENERY_VE1_TEMPLE_INTERIOR_3", /*130*/
+    "OBJ_SCENERY_AND_PASSAGE",           /*131*/
+    "OBJ_SCENERY_AND_DOOR",              /*132*/
+    "OBJ_SCENERY_TR_BUILDING",           /*133*/
+    "OBJ_SCENERY_AND_PATH_INTERSECTION", /*134*/
+    "OBJ_SCENERY_AND_PATH_WALLS",        /*135*/
+    "OBJ_SCENERY_AND_PATH_EXIT",         /*136*/
+    "OBJ_SCENERY_AND_PATH_ENTRANCE",     /*137*/
+    "OBJ_SCENERY_VS_BUILDING_1",         /*138*/
+    "OBJ_SCENERY_VS_BUILDING_2",         /*139*/
+    "OBJ_SCENERY_VS_PYRAMID_1",          /*140*/
+    "OBJ_SCENERY_VS_PYRAMID_2",          /*141*/
+    "OBJ_SCENERY_VS_ARCH",               /*142*/
+    "OBJ_SCENERY_VS_KA_FLBASE",          /*143*/
+    "OBJ_SCENERY_VS_SPACE_JUNK_1",       /*144*/
+    "OBJ_SCENERY_VS_SPACE_JUNK_2",       /*145*/
+    "OBJ_SCENERY_VS_SPACE_JUNK_3",       /*146*/
+    "OBJ_SCENERY_LEVEL_OBJECTS",         /*147*/
+    "OBJ_SCENERY_FO_MOUNTAIN_1",         /*148*/
+    "OBJ_SCENERY_FO_MOUNTAIN_2",         /*149*/
+    "OBJ_SCENERY_FO_MOUNTAIN_3",         /*150*/
+    "OBJ_SCENERY_FO_TOWER",              /*151*/
+    "OBJ_SCENERY_BO_POLE",               /*152*/
+    "OBJ_SCENERY_BO_BUILDING",           /*153*/
+    "OBJ_SCENERY_KA_FLBASE",             /*154*/
+    "OBJ_SCENERY_UNK_155",               /*155*/
+    "OBJ_SCENERY_SY_SHOGUN_SHIP",        /*156*/
+    "OBJ_SCENERY_SZ_SPACE_JUNK_3",       /*157*/
+    "OBJ_SCENERY_SZ_SPACE_JUNK_1",       /*158*/
+    "OBJ_SCENERY_VE2_TOWER",             /*159*/
+    "OBJ_SCENERY_VE2_MOUNTAIN",          /*160*/
+    "OBJ_SPRITE_CO_POLE",                /*161*/
+    "OBJ_SPRITE_CO_TREE",                /*162*/
+    "OBJ_SPRITE_FO_POLE",                /*163*/
+    "OBJ_SPRITE_FOG_SHADOW",             /*164*/
+    "OBJ_SPRITE_CO_RUIN1",               /*165*/
+    "OBJ_SPRITE_CO_RUIN2",               /*166*/
+    "OBJ_SPRITE_167",                    /*167*/
+    "OBJ_SPRITE_168",                    /*168*/
+    "OBJ_SPRITE_TI_CACTUS",              /*169*/
+    "OBJ_SPRITE_CO_SMOKE",               /*170*/
+    "OBJ_SPRITE_VE1_BOSS_TRIGGER1",      /*171*/
+    "OBJ_SPRITE_VE1_BOSS_TRIGGER2",      /*172*/
+    "OBJ_SPRITE_VE1_BOSS_TRIGGER3",      /*173*/
+    "OBJ_SPRITE_VE1_BOSS_TRIGGER4",      /*174*/
+    "OBJ_SPRITE_GFOX_TARGET",            /*175*/
+    "OBJ_ACTOR_CO_GARUDA_1",             /*176*/
+    "OBJ_ACTOR_CO_GARUDA_2",             /*177*/
+    "OBJ_ACTOR_CO_GARUDA_3",             /*178*/
+    "OBJ_ACTOR_CO_GARUDA_DESTROY",       /*179*/
+    "OBJ_ACTOR_ME_MOLAR_ROCK",           /*180*/
+    "OBJ_ACTOR_ME_METEOR_1",             /*181*/
+    "OBJ_ACTOR_ME_METEOR_2",             /*182*/
+    "OBJ_ACTOR_ME_METEOR_SHOWER_1",      /*183*/
+    "OBJ_ACTOR_ME_METEOR_SHOWER_2",      /*184*/
+    "OBJ_ACTOR_ME_METEOR_SHOWER_3",      /*185*/
+    "OBJ_ACTOR_ME_LASER_CANNON_1",       /*186*/
+    "OBJ_ACTOR_ME_LASER_CANNON_2",       /*187*/
+    "OBJ_ACTOR_AQ_UNK_188",              /*188*/
+    "OBJ_ACTOR_DEBRIS",                  /*189*/
+    "OBJ_ACTOR_MISSILE_SEEK_TEAM",       /*190*/
+    "OBJ_ACTOR_MISSILE_SEEK_PLAYER",     /*191*/
+    "OBJ_ACTOR_CO_SKIBOT",               /*192*/
+    "OBJ_ACTOR_CO_RADAR",                /*193*/
+    "OBJ_ACTOR_ME_MORA",                 /*194*/
+    "OBJ_ACTOR_CUTSCENE",                /*195*/
+    "OBJ_ACTOR_CO_MOLE_MISSILE",         /*196*/
+    "OBJ_ACTOR_ALLRANGE",                /*197*/
+    "OBJ_ACTOR_TEAM_BOSS",               /*198*/
+    "OBJ_ACTOR_TEAM_ARWING",             /*199*/
+    "OBJ_ACTOR_EVENT",                   /*200*/
+    "OBJ_ACTOR_ME_METEO_BALL",           /*201*/
+    "OBJ_ACTOR_ME_HOPBOT",               /*202*/
+    "OBJ_ACTOR_SX_SLIPPY",               /*203*/
+    "OBJ_ACTOR_SY_ROBOT",                /*204*/
+    "OBJ_ACTOR_MA_LOCOMOTIVE",           /*205*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_1",          /*206*/
+    "OBJ_ACTOR_207",                     /*207*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_2",          /*208*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_3",          /*209*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_4",          /*210*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_5",          /*211*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_6",          /*212*/
+    "OBJ_ACTOR_MA_TRAIN_CAR_7",          /*213*/
+    "OBJ_ACTOR_MA_RAILROAD_SWITCH",      /*214*/
+    "OBJ_ACTOR_MA_BOULDER",              /*215*/
+    "OBJ_ACTOR_MA_HORIZONTAL_LOCK_BAR",  /*216*/
+    "OBJ_ACTOR_MA_VERTICAL_LOCK_BAR",    /*217*/
+    "OBJ_ACTOR_MA_BARRIER",              /*218*/
+    "OBJ_ACTOR_MA_FALLING_BOULDER",      /*219*/
+    "OBJ_ACTOR_MA_BOMBDROP",             /*220*/
+    "OBJ_ACTOR_MA_SPEAR",                /*221*/
+    "OBJ_ACTOR_MA_SHOCK_BOX",            /*222*/
+    "OBJ_ACTOR_MA_RAILWAY_SIGNAL",       /*223*/
+    "OBJ_ACTOR_TI_TERRAIN",              /*224*/
+    "OBJ_ACTOR_TI_LANDMINE",             /*225*/
+    "OBJ_ACTOR_TI_DESERT_ROVER",         /*226*/
+    "OBJ_ACTOR_TI_DELPHOR",              /*227*/
+    "OBJ_ACTOR_TI_DELPHOR_HEAD",         /*228*/
+    "OBJ_ACTOR_TI_DESERT_CRAWLER",       /*229*/
+    "OBJ_ACTOR_TI_BOULDER",              /*230*/
+    "OBJ_ACTOR_TI_BOMB",                 /*231*/
+    "OBJ_ACTOR_TI_RASCO",                /*232*/
+    "OBJ_ACTOR_TI_FEKUDA",               /*233*/
+    "OBJ_ACTOR_TI_GREAT_FOX",            /*234*/
+    "OBJ_ACTOR_ZO_BIRD",                 /*235*/
+    "OBJ_ACTOR_ZO_DODORA",               /*236*/
+    "OBJ_ACTOR_UNK_237",                 /*237*/
+    "OBJ_ACTOR_ZO_FISH",                 /*238*/
+    "OBJ_ACTOR_ZO_DODORA_WP_COUNT",      /*239*/
+    "OBJ_ACTOR_ZO_Z_GULL",               /*240*/
+    "OBJ_ACTOR_ZO_ENERGY_BALL",          /*241*/
+    "OBJ_ACTOR_ZO_TROIKA",               /*242*/
+    "OBJ_ACTOR_ZO_SHRIMP",               /*243*/
+    "OBJ_ACTOR_ZO_OBNEMA",               /*244*/
+    "OBJ_ACTOR_ZO_BALL",                 /*245*/
+    "OBJ_ACTOR_ZO_MINE",                 /*246*/
+    "OBJ_ACTOR_ZO_BARRIER",              /*247*/
+    "OBJ_ACTOR_ZO_CRANE_MAGNET",         /*248*/
+    "OBJ_ACTOR_SPIKEBALL",               /*249*/
+    "OBJ_ACTOR_ZO_TANKER",               /*250*/
+    "OBJ_ACTOR_ZO_CONTAINER",            /*251*/
+    "OBJ_ACTOR_ZO_RADARBUOY",            /*252*/
+    "OBJ_ACTOR_ZO_SUPPLYCRANE",          /*253*/
+    "OBJ_ACTOR_ZO_SEARCHLIGHT",          /*254*/
+    "OBJ_ACTOR_255",                     /*255*/
+    "OBJ_ACTOR_256",                     /*256*/
+    "OBJ_ACTOR_257",                     /*257*/
+    "OBJ_ACTOR_AQ_PEARL",                /*258*/
+    "OBJ_ACTOR_AQ_ANGLERFISH",           /*259*/
+    "OBJ_ACTOR_AQ_GAROA",                /*260*/
+    "OBJ_ACTOR_AQ_SCULPIN",              /*261*/
+    "OBJ_ACTOR_AQ_SPINDLYFISH",          /*262*/
+    "OBJ_ACTOR_AQ_SQUID",                /*263*/
+    "OBJ_ACTOR_AQ_SEAWEED",              /*264*/
+    "OBJ_ACTOR_AQ_BOULDER",              /*265*/
+    "OBJ_ACTOR_AQ_CORAL",                /*266*/
+    "OBJ_ACTOR_AQ_JELLYFISH",            /*267*/
+    "OBJ_ACTOR_AQ_FISHGROUP",            /*268*/
+    "OBJ_ACTOR_AQ_STONE_COLUMN",         /*269*/
+    "OBJ_ACTOR_AQ_OYSTER",               /*270*/
+    "OBJ_ACTOR_BO_SHIELD_REACTOR",       /*271*/
+    "OBJ_ACTOR_BO_LASER_CANNON",         /*272*/
+    "OBJ_ACTOR_FO_RADAR",                /*273*/
+    "OBJ_ACTOR_SZ_SPACE_JUNK",           /*274*/
+    "OBJ_ACTOR_SO_ROCK_1",               /*275*/
+    "OBJ_ACTOR_SO_ROCK_2",               /*276*/
+    "OBJ_ACTOR_SO_ROCK_3",               /*277*/
+    "OBJ_ACTOR_SO_WAVE",                 /*278*/
+    "OBJ_ACTOR_SO_PROMINENCE",           /*279*/
+    "OBJ_ACTOR_VE1_PILLAR_1",            /*280*/
+    "OBJ_ACTOR_VE1_PILLAR_2",            /*281*/
+    "OBJ_ACTOR_VE1_PILLAR_3",            /*282*/
+    "OBJ_ACTOR_VE1_PILLAR_4",            /*283*/
+    "OBJ_ACTOR_VE1_MONKEY_STATUE",       /*284*/
+    "OBJ_ACTOR_AND_LASER_EMITTER",       /*285*/
+    "OBJ_ACTOR_AND_BRAIN_WASTE",         /*286*/
+    "OBJ_ACTOR_AND_EXPLOSION",           /*287*/
+    "OBJ_ACTOR_AND_RADIO",               /*288*/
+    "OBJ_ACTOR_AND_JAMES_TRIGGER",       /*289*/
+    "OBJ_ACTOR_AND_BOSS_TIMER_SET",      /*290*/
+    "OBJ_ACTOR_SUPPLIES",                /*291*/
+    "OBJ_BOSS_CO_GRANGA",                /*292*/
+    "OBJ_BOSS_CO_CARRIER",               /*293*/
+    "OBJ_BOSS_CO_CARRIER_LEFT",          /*294*/
+    "OBJ_BOSS_CO_CARRIER_UPPER",         /*295*/
+    "OBJ_BOSS_CO_CARRIER_BOTTOM",        /*296*/
+    "OBJ_BOSS_ME_CRUSHER",               /*297*/
+    "OBJ_BOSS_ME_CRUSHER_SHIELD",        /*298*/
+    "OBJ_BOSS_UNK_299",                  /*299*/
+    "OBJ_BOSS_UNK_300",                  /*300*/
+    "OBJ_BOSS_AQ_UNK_301",               /*301*/
+    "OBJ_BOSS_A6_GORGON",                /*302*/
+    "OBJ_BOSS_SX_SPYBORG",               /*303*/
+    "OBJ_BOSS_SX_SPYBORG_LEFT_ARM",      /*304*/
+    "OBJ_BOSS_SX_SPYBORG_RIGHT_ARM",     /*305*/
+    "OBJ_BOSS_TI_GORAS",                 /*306*/
+    "OBJ_BOSS_ZO_SARUMARINE",            /*307*/
+    "OBJ_BOSS_FO_BASE",                  /*308*/
+    "OBJ_BOSS_BO_BASE",                  /*309*/
+    "OBJ_BOSS_BO_BASE_SHIELD",           /*310*/
+    "OBJ_BOSS_BO_BASE_CORE",             /*311*/
+    "OBJ_BOSS_VE2_BASE",                 /*312*/
+    "OBJ_BOSS_SZ_GREAT_FOX",             /*313*/
+    "OBJ_BOSS_SY_SHOGUN",                /*314*/
+    "OBJ_BOSS_SO_VULKAIN",               /*315*/
+    "OBJ_BOSS_KA_SAUCERER",              /*316*/
+    "OBJ_BOSS_KA_FLBASE",                /*317*/
+    "OBJ_BOSS_AQ_BACOON",                /*318*/
+    "OBJ_BOSS_VE1_GOLEMECH",             /*319*/
+    "OBJ_BOSS_AND_ANDROSS",              /*320*/
+    "OBJ_BOSS_AND_BRAIN",                /*321*/
+    "OBJ_ITEM_LASERS",                   /*322*/
+    "OBJ_ITEM_CHECKPOINT",               /*323*/
+    "OBJ_ITEM_SILVER_RING",              /*324*/
+    "OBJ_ITEM_SILVER_STAR",              /*325*/
+    "OBJ_ITEM_METEO_WARP",               /*326*/
+    "OBJ_ITEM_BOMB",                     /*327*/
+    "OBJ_ITEM_PATH_SPLIT_X",             /*328*/
+    "OBJ_ITEM_PATH_TURN_LEFT",           /*329*/
+    "OBJ_ITEM_PATH_TURN_RIGHT",          /*330*/
+    "OBJ_ITEM_PATH_SPLIT_Y",             /*331*/
+    "OBJ_ITEM_PATH_TURN_UP",             /*332*/
+    "OBJ_ITEM_PATH_TURN_DOWN",           /*333*/
+    "OBJ_ITEM_RING_CHECK",               /*334*/
+    "OBJ_ITEM_1UP",                      /*335*/
+    "OBJ_ITEM_GOLD_RING",                /*336*/
+    "OBJ_ITEM_WING_REPAIR",              /*337*/
+    "OBJ_ITEM_TRAINING_RING",            /*338*/
+    "OBJ_EFFECT_FIRE_SMOKE_1",           /*339*/
+    "OBJ_EFFECT_FIRE_SMOKE_2",           /*340*/
+    "OBJ_EFFECT_FIRE_SMOKE_3",           /*341*/
+    "OBJ_EFFECT_SMOKE_1",                /*342*/
+    "OBJ_EFFECT_SMOKE_2",                /*343*/
+    "OBJ_EFFECT_EXPLOSION_MARK_1",       /*344*/
+    "OBJ_EFFECT_LASER_MARK_1",           /*345*/
+    "OBJ_EFFECT_346",                    /*346*/
+    "OBJ_EFFECT_347",                    /*347*/
+    "OBJ_EFFECT_348",                    /*348*/
+    "OBJ_EFFECT_349",                    /*349*/
+    "OBJ_EFFECT_350",                    /*350*/
+    "OBJ_EFFECT_351",                    /*351*/
+    "OBJ_EFFECT_CLOUDS",                 /*352*/
+    "OBJ_EFFECT_ENEMY_LASER_1",          /*353*/
+    "OBJ_EFFECT_354",                    /*354*/
+    "OBJ_EFFECT_355",                    /*355*/
+    "OBJ_EFFECT_356",                    /*356*/
+    "OBJ_EFFECT_357",                    /*357*/
+    "OBJ_EFFECT_KA_ENERGY_PARTICLES",    /*358*/
+    "OBJ_EFFECT_359",                    /*359*/
+    "OBJ_EFFECT_360",                    /*360*/
+    "OBJ_EFFECT_361",                    /*361*/
+    "OBJ_EFFECT_362",                    /*362*/
+    "OBJ_EFFECT_363",                    /*363*/
+    "OBJ_EFFECT_364",                    /*364*/
+    "OBJ_EFFECT_365",                    /*365*/
+    "OBJ_EFFECT_366",                    /*366*/
+    "OBJ_EFFECT_367",                    /*367*/
+    "OBJ_EFFECT_368",                    /*368*/
+    "OBJ_EFFECT_369",                    /*369*/
+    "OBJ_EFFECT_370",                    /*370*/
+    "OBJ_EFFECT_371",                    /*371*/
+    "OBJ_EFFECT_372",                    /*372*/
+    "OBJ_EFFECT_TIMED_SFX",              /*373*/
+    "OBJ_EFFECT_374",                    /*374*/
+    "OBJ_EFFECT_375",                    /*375*/
+    "OBJ_EFFECT_376",                    /*376*/
+    "OBJ_EFFECT_377",                    /*377*/
+    "OBJ_EFFECT_378",                    /*378*/
+    "OBJ_EFFECT_379",                    /*379*/
+    "OBJ_EFFECT_380",                    /*380*/
+    "OBJ_EFFECT_381",                    /*381*/
+    "OBJ_EFFECT_382",                    /*382*/
+    "OBJ_EFFECT_383",                    /*383*/
+    "OBJ_EFFECT_384",                    /*384*/
+    "OBJ_EFFECT_385",                    /*385*/
+    "OBJ_EFFECT_386",                    /*386*/
+    "OBJ_EFFECT_387",                    /*387*/
+    "OBJ_EFFECT_388",                    /*388*/
+    "OBJ_EFFECT_389",                    /*389*/
+    "OBJ_EFFECT_390",                    /*390*/
+    "OBJ_EFFECT_391",                    /*391*/
+    "OBJ_EFFECT_392",                    /*392*/
+    "OBJ_EFFECT_393",                    /*393*/
+    "OBJ_EFFECT_394",                    /*394*/
+    "OBJ_EFFECT_395",                    /*395*/
+    "OBJ_EFFECT_396",                    /*396*/
+    "OBJ_EFFECT_397",                    /*397*/
+    "OBJ_EFFECT_398",                    /*398*/
+    "OBJ_EFFECT_399",                    /*399*/
+    "OBJ_ENV_SMALL_ROCKS_ENABLE",        /*400*/
+    "OBJ_ENV_SMALL_ROCKS_DISABLE",       /*401*/
+    "OBJ_UNK_402",                       /*402*/
+    "OBJ_UNK_403",                       /*403*/
+    "OBJ_UNK_404",                       /*404*/
+    "OBJ_UNK_405"                        /*405*/
+};
+
+// Returns human-readable name for an ObjectId (handles event ids).
+static const char* Randomizer_ObjectIdToString(s32 id) {
+    if (id >= 0 && id < OBJ_ID_MAX) {
+        return sObjectIdNames[id];
+    }
+    if (id >= ACTOR_EVENT_ID) {
+        static char buf[64];
+        snprintf(buf, sizeof(buf), "EVENT_%d", id - ACTOR_EVENT_ID);
+        return buf;
+    }
+    return "OBJ_INVALID_OR_UNKNOWN";
+}
+
+static ObjectCategory GetObjectCategory(ObjectId id) {
+    // Handle event actors
+    if (id >= ACTOR_EVENT_ID) {
+        s32 evIndex = id - ACTOR_EVENT_ID;
+        // Check event actor type by looking at the event index
+        // Events 22 (Slippy), 50 (Peppy), 80 (Falco) are flight-type crewmates
+        if ((evIndex == 22) || (evIndex == 50) || (evIndex == 80)) {
+            return OBJ_CATEGORY_FLIGHT; // Crewmates flying alongside you
+        }
+        return OBJ_CATEGORY_SPECIAL; // Other events
+    }
+
+    // Flight types
+    if ((id >= OBJ_ACTOR_CO_GARUDA_1 && id <= OBJ_ACTOR_CO_GARUDA_3) || (id == OBJ_ACTOR_SX_SLIPPY) ||
+        (id == OBJ_ACTOR_SY_ROBOT) || (id == OBJ_ACTOR_ME_HOPBOT) || (id == OBJ_ACTOR_ZO_Z_GULL) ||
+        (id == OBJ_ACTOR_ZO_DODORA) || (id == OBJ_ACTOR_ME_MORA) || (id == OBJ_ACTOR_ALLRANGE)) {
+        return OBJ_CATEGORY_FLIGHT;
+    }
+    // Ground types
+    if ((id == OBJ_ACTOR_CO_SKIBOT) || (id == OBJ_ACTOR_TI_DESERT_ROVER) || (id == OBJ_ACTOR_TI_DELPHOR) ||
+        (id == OBJ_ACTOR_TI_RASCO) || (id == OBJ_ACTOR_TI_FEKUDA) || (id == OBJ_ACTOR_ME_METEOR_1) ||
+        (id == OBJ_ACTOR_ME_METEOR_2) || (id == OBJ_ACTOR_ME_LASER_CANNON_1) || (id == OBJ_ACTOR_ME_LASER_CANNON_2) ||
+        (id == OBJ_ACTOR_ME_MOLAR_ROCK) || (id == OBJ_ACTOR_ZO_SHRIMP) || (id == OBJ_ACTOR_ZO_OBNEMA) ||
+        (id == OBJ_ACTOR_ZO_TROIKA) || (id == OBJ_ACTOR_AQ_ANGLERFISH) || (id == OBJ_ACTOR_AQ_GAROA) ||
+        (id == OBJ_ACTOR_AQ_SCULPIN) || (id == OBJ_ACTOR_AQ_JELLYFISH)) {
+        return OBJ_CATEGORY_GROUND;
+    }
+    // Boss types
+    if (id >= OBJ_BOSS_START && id < OBJ_BOSS_MAX) {
+        return OBJ_CATEGORY_BOSS;
+    }
+    // Terrain/scenery
+    if (id < OBJ_SCENERY_MAX || (id >= OBJ_SPRITE_START && id < OBJ_SPRITE_MAX)) {
+        return OBJ_CATEGORY_TERRAIN;
+    }
+    // Special (crewmates, event actors, team members)
+    if ((id == OBJ_ACTOR_TEAM_BOSS) || (id == OBJ_ACTOR_TEAM_ARWING) || (id == OBJ_ACTOR_EVENT) ||
+        (id == OBJ_ACTOR_CUTSCENE) || (id == OBJ_ACTOR_ALLRANGE)) {
+        return OBJ_CATEGORY_SPECIAL;
+    }
+    // Items
+    if (id >= OBJ_ITEM_START && id < OBJ_ITEM_MAX) {
+        return OBJ_CATEGORY_TERRAIN;
+    }
+
+    return OBJ_CATEGORY_UNKNOWN;
+}
+
+static const char* GetCategoryName(ObjectCategory cat) {
+    switch (cat) {
+        case OBJ_CATEGORY_FLIGHT:
+            return "FLIGHT";
+        case OBJ_CATEGORY_GROUND:
+            return "GROUND";
+        case OBJ_CATEGORY_BOSS:
+            return "BOSS";
+        case OBJ_CATEGORY_TERRAIN:
+            return "TERRAIN";
+        case OBJ_CATEGORY_SPECIAL:
+            return "SPECIAL";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+// Enhanced logging helper
+static void LogReplacement(const char* context, ObjectId origId, ObjectId newId, bool replaced, const char* reason) {
+    ObjectCategory origCat = GetObjectCategory(origId);
+    const char* origStr = Randomizer_ObjectIdToString((s32) origId);
+    const char* newStr = Randomizer_ObjectIdToString((s32) newId);
+
+    if (replaced) {
+        printf("[RANDOMIZER] %s | %s | REPLACED | %d (%s) → %d (%s) | Reason: %s\n", context, GetCategoryName(origCat),
+               (s32) origId, origStr, (s32) newId, newStr, reason);
+    } else {
+        printf("[RANDOMIZER] %s | %s | NOT_REPLACED | %d (%s) | Reason: %s\n", context, GetCategoryName(origCat),
+               (s32) origId, origStr, reason);
+    }
+}
+
+#define LEVEL_ACTOR_POOL_MAX 256
+#define MIN_LEVEL_POOL_SIZE 3
+
+static u16 s_levelActorPool[LEVEL_ACTOR_POOL_MAX];
+static s32 s_levelActorCount = 0;
+static u8 s_poolBuiltLevel = 0;
+
+
+
+// Helper: compare cull distances with relative tolerance + small-object special-case.
+// strict == true uses stricter ratio; false uses relaxed ratio.
+static bool CullDistanceCompatible(f32 origCull, f32 candCull, bool strict) {
+    if (!RANDOMIZER_FILTER_CULL_DISTANCE) {
+        return true;
+    }
+
+    const f32 SMALL_MAX_STRICT = 500.0f; // both smaller than this -> compatible
+    const f32 SMALL_MAX_RELAXED = 1000.0f;
+    const f32 RATIO_STRICT = 4.0f;
+    const f32 RATIO_RELAXED = 8.0f;
+
+    if (origCull <= 0.0f || candCull <= 0.0f) {
+        return true;
+    }
+
+    if (strict) {
+        if ((origCull < SMALL_MAX_STRICT) && (candCull < SMALL_MAX_STRICT)) {
+            return true;
+        }
+    } else {
+        if ((origCull < SMALL_MAX_RELAXED) && (candCull < SMALL_MAX_RELAXED)) {
+            return true;
+        }
+    }
+
+    f32 a = origCull;
+    f32 b = candCull;
+    f32 ratio = (a > b) ? (a / b) : (b / a);
+
+    return strict ? (ratio <= RATIO_STRICT) : (ratio <= RATIO_RELAXED);
+}
+
+// IDs that should never be swapped into or out of
+static const ObjectId s_excludeActorIds[] = {
+    OBJ_ACTOR_TEAM_BOSS, OBJ_ACTOR_TEAM_ARWING,
+    // Add other partner/special IDs here if you find them in logs.
+};
+
+static bool IsExcludedActor(ObjectId id) {
+    for (size_t i = 0; i < ARRAY_COUNT(s_excludeActorIds); ++i) {
+        if (s_excludeActorIds[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Event actor metadata is defined in fox_enmy2.c as `sEventActorInfo[]`.
+typedef struct {
+    void* dList;
+    f32* hitbox;
+    f32 scale;
+    f32 cullDistance;
+    f32 unk_10;
+    u8 info_unk_16;
+    u8 info_unk_14;
+    u8 sfx;
+    u8 info_unk_19;
+    f32 targetOffset;
+    u8 bonus;
+} EventActorInfo;
+extern EventActorInfo sEventActorInfo[];
+#define EVENT_ACTOR_COUNT 108
+
+// Helper to get cullDistance and whether the id is an event actor.
+// Always safe — reads sEventActorInfo[] for event ids and gObjectInfo[] otherwise.
+static void GetCullAndFlags(s32 id, f32* outCull, bool* outIsEvent) {
+    if (id >= ACTOR_EVENT_ID) {
+        s32 evIndex = id - ACTOR_EVENT_ID;
+        if (evIndex >= 0 && evIndex < EVENT_ACTOR_COUNT) {
+            *outCull = sEventActorInfo[evIndex].cullDistance;
+            *outIsEvent = true;
+            return;
+        }
+        // Out-of-range event id - fallback to a conservative cullDistance
+        *outCull = 1000.0f;
+        *outIsEvent = true;
+    } else {
+        // Normal actor/object
+        *outCull = gObjectInfo[id].cullDistance;
+        *outIsEvent = false;
+    }
+}
+
+// Build the actor candidate pool. This is only run once per level load
+// (controlled by s_poolBuiltLevel). It collects:
+//  1) actors from the level ObjectInit table (if present).
+//  2) event/script actors from the compile-time sEventActorInfo table.
+//  3) optional global fallback from gObjectInfo when pool is too small.
+//
+// Verbose logging shows what we added and final pool size.
+static void BuildActorPoolIfNeeded(void) {
+    if (s_poolBuiltLevel) {
+        return;
+    }
+
+    s_levelActorCount = 0;
+    ObjectInit* levelObjs = gLevelObjects;
+    if (levelObjs == NULL) {
+        levelObjs = SEGMENTED_TO_VIRTUAL(gLevelObjectInits[gCurrentLevel]);
+    }
+
+    printf("RANDOMIZER :: BuildActorPoolIfNeeded :: Building actor pool for level %d\n", gCurrentLevel);
+
+    // 1) From level ObjectInit
+    if (levelObjs != NULL) {
+        for (s32 i = 0; i < 10000; ++i) {
+            s16 id = levelObjs[i].id;
+            if (id <= OBJ_INVALID) {
+                break;
+            }
+            if ((id >= OBJ_ACTOR_START) && (id < OBJ_ACTOR_MAX)) {
+                if (IsExcludedActor((ObjectId) id)) {
+                    continue;
+                }
+                // dedupe
+                s32 found = 0;
+                for (s32 j = 0; j < s_levelActorCount; ++j) {
+                    if ((s32) s_levelActorPool[j] == id) {
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found && s_levelActorCount < LEVEL_ACTOR_POOL_MAX) {
+                    s_levelActorPool[s_levelActorCount++] = (u16) id;
+                }
+            }
+        }
+    }
+
+    // 2) Add event/scripted actor types (safe static table)
+    for (s32 ev = 0; ev < EVENT_ACTOR_COUNT; ++ev) {
+        s32 candidate = ACTOR_EVENT_ID + ev;
+        if (IsExcludedActor((ObjectId) candidate)) {
+            continue;
+        }
+        // dedupe
+        s32 found = 0;
+        for (s32 j = 0; j < s_levelActorCount; ++j) {
+            if ((s32) s_levelActorPool[j] == candidate) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found && s_levelActorCount < LEVEL_ACTOR_POOL_MAX) {
+            s_levelActorPool[s_levelActorCount++] = (u16) candidate;
+        }
+    }
+
+    // 3) Fallback: add from global actor range if pool is too small
+    if (s_levelActorCount < MIN_LEVEL_POOL_SIZE) {
+        printf("RANDOMIZER :: BuildActorPoolIfNeeded :: level-derived pool small (%d entries) — falling back to global actor list\n",
+               s_levelActorCount);
+        for (s32 id = OBJ_ACTOR_START; id < OBJ_ACTOR_MAX; ++id) {
+            if (IsExcludedActor((ObjectId) id)) {
+                continue;
+            }
+            s32 found = 0;
+            for (s32 j = 0; j < s_levelActorCount; ++j) {
+                if ((s32) s_levelActorPool[j] == id) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && s_levelActorCount < LEVEL_ACTOR_POOL_MAX) {
+                s_levelActorPool[s_levelActorCount++] = (u16) id;
+            }
+        }
+    }
+
+    // Log pool summary (show up to first 24 entries)
+    printf("RANDOMIZER :: BuildActorPoolIfNeeded :: final pool size = %d\n", s_levelActorCount);
+    {
+        char buf[256];
+        int off = 0;
+        off += snprintf(buf + off, sizeof(buf) - off, "RANDOMIZER :: BuildActorPoolIfNeeded :: pool ids:");
+        for (s32 i = 0; i < s_levelActorCount && i < 24; ++i) {
+            off += snprintf(buf + off, sizeof(buf) - off, " %d", s_levelActorPool[i]);
+        }
+        if (s_levelActorCount > 24) {
+            snprintf(buf + off, sizeof(buf) - off, " ...");
+        }
+        printf("%s\n", buf);
+    }
+
+    s_poolBuiltLevel = 1;
+}
+
+static s16 PickRandomActorFromPoolDifferent(s16 originalId, bool allowEvent) {
+    if (!RANDOMIZER_ENABLED) {
+        LogReplacement("PickRandomActorFromPoolDifferent", originalId, originalId, false, "RANDOMIZER_ENABLED=0");
+        return originalId;
+    }
+
+    BuildActorPoolIfNeeded();
+
+    if (s_levelActorCount <= 0) {
+        LogReplacement("PickRandomActorFromPoolDifferent", originalId, originalId, false, "Pool is empty");
+        return originalId;
+    }
+
+    if (s_levelActorCount == 1 && (s16) s_levelActorPool[0] == originalId) {
+        LogReplacement("PickRandomActorFromPoolDifferent", originalId, originalId, false,
+                       "Only 1 candidate equals original");
+        return originalId;
+    }
+
+    s32 candidates_any[LEVEL_ACTOR_POOL_MAX];
+    s32 anyCount = 0;
+    s32 rejectedCount = 0;
+
+    f32 origCull;
+    bool origIsEvent;
+    GetCullAndFlags(originalId, &origCull, &origIsEvent);
+
+    ObjectInfo origInfo;
+    if (!origIsEvent) {
+        origInfo = gObjectInfo[originalId];
+    }
+
+    printf("[RANDOMIZER_DETAIL] Pool iteration for %d (%s), pool size=%d, allowEvent=%d\n", originalId,
+           Randomizer_ObjectIdToString(originalId), s_levelActorCount, allowEvent);
+
+    for (s32 i = 0; i < s_levelActorCount; ++i) {
+        s16 candId = (s16) s_levelActorPool[i];
+        const char* rejectReason = NULL;
+
+        // Skip self
+        if (candId == originalId) {
+            continue;
+        }
+
+        // Check event filter
+        if (!allowEvent && (candId >= ACTOR_EVENT_ID)) {
+            rejectReason = "Event actor (allowEvent=false)";
+        }
+        // Check exclude events filter
+        else if (RANDOMIZER_FILTER_EXCLUDE_EVENTS && (candId >= ACTOR_EVENT_ID)) {
+            rejectReason = "Event actor (RANDOMIZER_FILTER_EXCLUDE_EVENTS=1)";
+        }
+        // Check excluded partners
+        else if (RANDOMIZER_FILTER_EXCLUDE_PARTNERS && IsExcludedActor((ObjectId) candId)) {
+            rejectReason = "Excluded actor (partner/special)";
+        }
+
+        // If already rejected, log and skip
+        if (rejectReason != NULL) {
+            printf("[RANDOMIZER_DETAIL]   Candidate %d (%s) REJECTED: %s\n", candId,
+                   Randomizer_ObjectIdToString(candId), rejectReason);
+            rejectedCount++;
+            continue;
+        }
+
+        f32 candCull;
+        bool candIsEvent;
+        GetCullAndFlags(candId, &candCull, &candIsEvent);
+
+        bool passes = true;
+        const char* failReason = NULL;
+
+        // Apply drawType filter if enabled
+        if (RANDOMIZER_FILTER_DRAWTYPE && !origIsEvent && !candIsEvent) {
+            ObjectInfo candInfo = gObjectInfo[candId];
+            if (candInfo.drawType != origInfo.drawType) {
+                passes = false;
+                failReason = "drawType mismatch";
+            }
+        }
+
+        // Apply action filter if enabled
+        if (passes && RANDOMIZER_FILTER_ACTION && !origIsEvent && !candIsEvent) {
+            ObjectInfo candInfo = gObjectInfo[candId];
+            if ((candInfo.action != NULL) && (origInfo.action != NULL) && (candInfo.action != origInfo.action)) {
+                passes = false;
+                failReason = "action mismatch";
+            }
+        }
+
+        // Apply cull distance filter if enabled
+        if (passes && RANDOMIZER_FILTER_CULL_DISTANCE) {
+            if (!CullDistanceCompatible(origCull, candCull, false)) {
+                passes = false;
+                failReason = "cull distance incompatible";
+            }
+        }
+
+        if (passes) {
+            candidates_any[anyCount++] = i;
+            printf("[RANDOMIZER_DETAIL]   Candidate %d (%s) ACCEPTED (cull: %.1f)\n", candId,
+                   Randomizer_ObjectIdToString(candId), candCull);
+        } else {
+            printf("[RANDOMIZER_DETAIL]   Candidate %d (%s) REJECTED: %s\n", candId,
+                   Randomizer_ObjectIdToString(candId), failReason);
+            rejectedCount++;
+        }
+    }
+
+    printf("[RANDOMIZER_DETAIL] Summary: %d accepted, %d rejected\n", anyCount, rejectedCount);
+
+    if (anyCount <= 0) {
+        LogReplacement("PickRandomActorFromPoolDifferent", originalId, originalId, false,
+                       "No candidates passed filters");
+        return originalId;
+    }
+
+    s32 finalPickIdx = (s32) (Rand_ZeroOne() * (f32) anyCount);
+    if (finalPickIdx < 0)
+        finalPickIdx = 0;
+    if (finalPickIdx >= anyCount)
+        finalPickIdx = anyCount - 1;
+    s32 chosenPoolIndex = candidates_any[finalPickIdx];
+
+    s16 chosenId = (s16) s_levelActorPool[chosenPoolIndex];
+    LogReplacement("PickRandomActorFromPoolDifferent", originalId, chosenId, true, "Randomly selected from candidates");
+    return chosenId;
+}
+
+// MaybeRandomizeObjectInit: called when level objects are being loaded/inserted.
+// It will attempt to replace actor-range ids with a picked replacement.
+static void MaybeRandomizeObjectInit(ObjectInit* objInit) {
+    // Only run for Corneria during testing
+    //if (gCurrentLevel != LEVEL_CORNERIA) {
+    //    return;
+    //}
+
+    // Handle both regular actors AND event actors
+    bool isRegularActor = (objInit->id >= OBJ_ACTOR_START) && (objInit->id < OBJ_ACTOR_MAX);
+    bool isEventActor = (objInit->id >= ACTOR_EVENT_ID);
+
+    if (!isRegularActor && !isEventActor) {
+        LogReplacement("MaybeRandomizeObjectInit", objInit->id, objInit->id, false, "Not an actor ID");
+        return;
+    }
+
+    if (IsExcludedActor((ObjectId) objInit->id)) {
+        LogReplacement("MaybeRandomizeObjectInit", objInit->id, objInit->id, false, "Excluded actor");
+        return;
+    }
+
+    s16 original = (s16) objInit->id;
+    // For event actors, allow picking other events; for regular actors, also allow events
+    s16 newId = PickRandomActorFromPoolDifferent((s16) objInit->id, true);
+    if (newId != original) {
+        ObjectCategory cat = GetObjectCategory((ObjectId) original);
+        printf("[RANDOMIZER_PLACEMENT] %s Object at pos(x=%.1f, y=%.1f, z=%.1f) replaced\n", GetCategoryName(cat),
+               (f32) objInit->xPos, (f32) objInit->yPos, (f32) objInit->zPos1);
+        objInit->id = (s16) newId;
+    } else {
+        LogReplacement("MaybeRandomizeObjectInit", original, original, false, "No replacement found");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Object_SetInfo: safely handle both normal and event actor ids when populating
+// an ObjectInfo structure. Event actor ids are encoded as ACTOR_EVENT_ID + eventType.
+// -----------------------------------------------------------------------------
 void Object_SetInfo(ObjectInfo* info, u32 objId) {
+    // If this is an event-actor id, populate from sEventActorInfo table.
+    if (objId >= ACTOR_EVENT_ID) {
+        s32 evIndex = (s32) objId - ACTOR_EVENT_ID;
+        if ((evIndex >= 0) && (evIndex < EVENT_ACTOR_COUNT)) {
+            EventActorInfo* ev = &sEventActorInfo[evIndex];
+
+            // Map EventActorInfo fields into ObjectInfo conservatively.
+            info->dList = (Gfx*) ev->dList;
+            // drawType is inferred — event actors often use a display list, but this is a conservative guess.
+            info->drawType = (ev->dList != NULL) ? 1 : 0;
+            info->action = NULL; // event actors run through the event system
+            info->hitbox = SEGMENTED_TO_VIRTUAL(ev->hitbox);
+            info->cullDistance = ev->cullDistance;
+            info->unk_14 = (s16) ev->info_unk_14;
+            info->unk_16 = (s16) ev->info_unk_16;
+            info->damage = 0;
+            info->unk_19 = ev->info_unk_19;
+            info->targetOffset = ev->targetOffset;
+            info->bonus = ev->bonus;
+
+            if (gLevelMode == LEVELMODE_TURRET) {
+                info->cullDistance += 200.0f;
+            }
+            printf("RANDOMIZER :: Object_SetInfo :: Object_SetInfo filled from sEventActorInfo index %d (objId=%d)\n", evIndex, objId);
+            return;
+        } else {
+            // Unexpected event index — log and fall through to safe fallback
+            printf("RANDOMIZER :: Object_SetInfo :: Object_SetInfo received out-of-range event objId %u — falling back\n", objId);
+        }
+    }
+
+    // Defensive bounds check: use OBJ_ID_MAX (enum) instead of ARRAY_COUNT(gObjectInfo)
+    // to avoid referencing the size of an externally-defined array whose type may be incomplete here.
+    if (objId > OBJ_ID_MAX) {
+        printf("RANDOMIZER :: Object_SetInfo :: Object_SetInfo called with invalid objId %u — using fallback values\n", objId);
+        memset(info, 0, sizeof(*info));
+        info->hitbox = NULL;
+        info->cullDistance = 1000.0f;
+        return;
+    }
+
+    // Normal object id: copy from gObjectInfo.
     *info = gObjectInfo[objId];
     info->hitbox = SEGMENTED_TO_VIRTUAL(gObjectInfo[objId].hitbox);
     if (gLevelMode == LEVELMODE_TURRET) {
         info->cullDistance += 200.0f;
     }
+    printf("RANDOMIZER :: Object_SetInfo :: Object_SetInfo filled from gObjectInfo for objId %u\n", objId);
 }
 
 void Scenery_Initialize(Scenery* this) {
@@ -541,6 +1502,8 @@ void func_enmy_80062568(void) {
     objInit = &gLevelObjects[i];
 
     for (; i < gSavedObjectLoadIndex; i++, objInit++) {
+        // --- Call insertion in func_enmy_80062568 ---
+        MaybeRandomizeObjectInit(objInit); // <-- insert here
         Object_Load(objInit, 4000.0f, -4000.0f, 4000.0f, -4000.0f);
     }
 }
@@ -631,9 +1594,11 @@ void Object_LoadLevelObjects(void) {
             if ((gCurrentLevel == LEVEL_VENOM_1) && (objInit->id >= ACTOR_EVENT_ID)) {
                 if (((objInit->rot.y < 180.0f) && (objInit->xPos < gPlayer[0].xPath)) ||
                     ((objInit->rot.y > 180.0f) && (gPlayer[0].xPath < objInit->xPos))) {
+                    MaybeRandomizeObjectInit(objInit); // <-- insert here
                     Object_Load(objInit, xMax, xMin, yMax, yMin);
                 }
             } else {
+                MaybeRandomizeObjectInit(objInit); // <-- and here
                 Object_Load(objInit, xMax, xMin, yMax, yMin);
             }
         } else {
@@ -1093,6 +2058,65 @@ void func_enmy_80063F74(Item* item) {
     item->width = item->obj.rot.z * 100.0f;
 }
 
+// -----------------------------------------------------------------------------
+// Helper: Convert an existing actor slot into an Event actor (in-place).
+// This replicates the minimal initialization done by ActorEvent_Load but
+// preserves the slot's current position/rotation so dynamic spawns keep their coordinates.
+// -----------------------------------------------------------------------------
+static void ConvertActorSlotToEvent(s32 index, s32 eventPick) {
+    if ((index < 0) || (index >= ARRAY_COUNT(gActors))) {
+        printf("RANDOMIZER :: ConvertActorSlotToEvent :: invalid index %d\n", index);
+        return;
+    }
+
+    s32 evIndex = eventPick - ACTOR_EVENT_ID;
+    if ((evIndex < 0) || (evIndex >= EVENT_ACTOR_COUNT)) {
+        printf("RANDOMIZER :: ConvertActorSlotToEvent :: invalid event index %d (pick=%d)\n", evIndex, eventPick);
+        return;
+    }
+
+    Actor* a = &gActors[index];
+
+    // Keep current position/rotation; replicate essential ActorEvent_Load state
+    a->obj.id = OBJ_ACTOR_EVENT;
+    a->obj.status = OBJ_ACTIVE;
+    a->index = index;
+
+    // approx. ActorEvent_Load defaults
+    a->timer_0C2 = 10;
+    a->eventType = EVID_FFF; // default placeholder used by ActorEvent_Load
+    a->aiType = evIndex;     // event actor index
+    // preserve current rotation in rot_0F4 as ActorEvent_Load would set from ObjectInit
+    a->rot_0F4.x = a->obj.rot.x;
+    a->rot_0F4.y = a->obj.rot.y;
+    a->rot_0F4.z = a->obj.rot.z;
+
+    // Fill ObjectInfo for event actor id (safe)
+    Object_SetInfo(&a->info, a->obj.id);
+    a->info.cullDistance = 3000.0f;
+
+    // Mimic ActorEvent_Load work/iwrok initial values used by formation/event code
+    a->fwork[25] = 20000.0f;
+    a->fwork[22] = gArwingSpeed;
+
+    // remember previous/leader indices like ActorEvent_Load
+    a->iwork[1] = gPrevEventActorIndex;
+    if ((gPrevEventActorIndex >= 0) && (gPrevEventActorIndex < ARRAY_COUNT(gActors))) {
+        a->iwork[10] = gActors[gPrevEventActorIndex].aiType;
+    } else {
+        a->iwork[10] = 0;
+    }
+    a->iwork[9] = gFormationLeaderIndex;
+
+    // update global last event actor index as ActorEvent_Load does
+    gPrevEventActorIndex = index;
+
+    printf("RANDOMIZER :: ConvertActorSlotToEvent :: converted actor slot %d -> EVENT (evIndex=%d)\n", index, evIndex);
+
+    // Run one update to let event-specific initialization run (mirrors ActorEvent_Load calling Actor_Update)
+    Actor_Update(a);
+}
+
 void Object_Init(s32 index, ObjectId objId) {
     s32 i;
     s32 j;
@@ -1100,6 +2124,27 @@ void Object_Init(s32 index, ObjectId objId) {
     f32 zRot;
     f32 sp4C;
     PosRot* var_v0;
+
+    // Dynamic-spawn coverage: randomize inside Object_Init for actor cases
+    if ((objId >= OBJ_ACTOR_START) && (objId < OBJ_ACTOR_MAX)) {
+        s16 original = (s16) objId;
+        s16 pick = PickRandomActorFromPoolDifferent(original, true);
+
+        if (pick != original) {
+            printf("[RANDOMIZER_DYNAMIC_SPAWN] At index %d\n", index);
+            if (pick >= ACTOR_EVENT_ID) {
+                ConvertActorSlotToEvent(index, pick);
+                return;
+            }
+
+            if ((pick >= OBJ_ACTOR_START) && (pick < OBJ_ACTOR_MAX)) {
+                objId = (ObjectId) pick;
+                if ((index >= 0) && (index < ARRAY_COUNT(gActors))) {
+                    gActors[index].obj.id = (u16) pick;
+                }
+            }
+        }
+    }
 
     switch (objId) {
         case OBJ_SPRITE_CO_SMOKE:
