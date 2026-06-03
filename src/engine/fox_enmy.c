@@ -78,11 +78,11 @@ u32 gWarpRingSfx[] = {
 };
 
 void Object_PlayerSfx(f32* pos, u32 sfxId, s32 playerNum) {
-    printf("CHIME SET \n");
-    printf("BOMB SET 1\n");
-    printf("BOMB SET 2\n");
-    printf("center_X        %f\n");
-    printf("Enm->obj.pos.x  %f\n");
+    PRINTF("CHIME SET \n");
+    PRINTF("BOMB SET 1\n");
+    PRINTF("BOMB SET 2\n");
+    PRINTF("center_X        %f\n");
+    PRINTF("Enm->obj.pos.x  %f\n");
     if (!gVersusMode) {
         AUDIO_PLAY_SFX(sfxId, gDefaultSfxSource, 4);
     } else {
